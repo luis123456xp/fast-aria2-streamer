@@ -1,0 +1,44 @@
+#aria2-replace{
+  position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
+  padding: 10px 14px; border-radius: 8px; background: #111; color: #fff;
+  font-family: system-ui, sans-serif; font-size: 14px; cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0,0,0,.3);
+}
+#aria2-replace:hover{ opacity:.9; }
+
+#aria2-floating{
+  position: fixed; right: 16px; bottom: 72px; z-index: 2147483647;
+  width: min(480px, 90vw);
+}
+#aria2-floating .aria2-card{
+  background: #0e0e0e; color: #fff;
+  border-radius: 10px; padding: 14px 16px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.35);
+  font-family: system-ui, sans-serif;
+}
+#aria2-floating .aria2-row{
+  display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;
+  gap: 8px;
+}
+#aria2-floating .aria2-actions{ display:flex; align-items:center; gap:8px; }
+#aria2-floating .aria2-btn{
+  background: #2a2a2a; color:#fff; border:0; border-radius:8px; padding:6px 10px; cursor:pointer;
+}
+#aria2-floating .aria2-btn:hover{ background:#3a3a3a; }
+#aria2-floating .aria2-btn.danger{ background:#a83232; }
+#aria2-floating .aria2-btn.danger:hover{ background:#c33a3a; }
+
+#aria2-floating .aria2-keep{ font-size: 12px; opacity:.9; display:flex; align-items:center; gap:6px; }
+
+#aria2-floating .aria2-bar{
+  height: 10px; border-radius: 6px; background: #2b2b2b; overflow: hidden;
+}
+#aria2-floating .aria2-bar-fill{
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, #3ddc84, #24a86d);
+  transition: width .25s ease;
+}
+#aria2-floating .aria2-stats{
+  display:flex; gap:12px; margin-top:8px; font-size:13px; opacity:.95;
+  flex-wrap: wrap;
+}
