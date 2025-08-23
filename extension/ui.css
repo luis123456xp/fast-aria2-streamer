@@ -1,3 +1,4 @@
+/* Botón flotante para iniciar descarga */
 #aria2-replace{
   position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
   padding: 10px 14px; border-radius: 8px; background: #111; color: #fff;
@@ -6,39 +7,37 @@
 }
 #aria2-replace:hover{ opacity:.9; }
 
+/* Tarjeta */
 #aria2-floating{
   position: fixed; right: 16px; bottom: 72px; z-index: 2147483647;
-  width: min(480px, 90vw);
+  width: min(500px, 92vw);
 }
 #aria2-floating .aria2-card{
   background: #0e0e0e; color: #fff;
   border-radius: 10px; padding: 14px 16px;
   box-shadow: 0 10px 30px rgba(0,0,0,.35);
-  font-family: system-ui, sans-serif;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
-#aria2-floating .aria2-row{
-  display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;
-  gap: 8px;
-}
-#aria2-floating .aria2-actions{ display:flex; align-items:center; gap:8px; }
+#aria2-floating .aria2-row{ display:flex; align-items:center; justify-content:space-between; gap:12px; }
+#aria2-floating .aria2-actions{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+
 #aria2-floating .aria2-btn{
-  background: #2a2a2a; color:#fff; border:0; border-radius:8px; padding:6px 10px; cursor:pointer;
+  background:#1d1d1d; border:1px solid #333; color:#fff; border-radius:8px;
+  padding:6px 10px; font-size:13px; cursor:pointer;
 }
-#aria2-floating .aria2-btn:hover{ background:#3a3a3a; }
-#aria2-floating .aria2-btn.danger{ background:#a83232; }
-#aria2-floating .aria2-btn.danger:hover{ background:#c33a3a; }
+#aria2-floating .aria2-btn:hover{ background:#232323; }
+#aria2-floating .aria2-btn.danger{ border-color:#7a2b2b; }
+#aria2-floating .aria2-btn.danger:hover{ background:#2a1717; }
 
 #aria2-floating .aria2-keep{ font-size: 12px; opacity:.9; display:flex; align-items:center; gap:6px; }
+#aria2-floating .aria2-stats{ display:flex; gap:12px; margin-top:8px; font-size:13px; opacity:.95; flex-wrap:wrap; }
+#aria2-floating .aria2-state{ font-size:12px; opacity:.85; margin-top:6px; }
 
-#aria2-floating .aria2-bar{
-  height: 10px; border-radius: 6px; background: #2b2b2b; overflow: hidden;
+/* Punto flotante para "minimizado" */
+#aria2-dot{
+  position: fixed; right: 18px; bottom: 76px; z-index: 2147483647;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #00d4ff; box-shadow: 0 0 10px rgba(0,212,255,.8), 0 0 2px rgba(0,0,0,.6);
+  cursor: pointer; display:none;
 }
-#aria2-floating .aria2-bar-fill{
-  height: 100%; width: 0%;
-  background: linear-gradient(90deg, #3ddc84, #24a86d);
-  transition: width .25s ease;
-}
-#aria2-floating .aria2-stats{
-  display:flex; gap:12px; margin-top:8px; font-size:13px; opacity:.95;
-  flex-wrap: wrap;
-}
+#aria2-dot.visible{ display:block; }
