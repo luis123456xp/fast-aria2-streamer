@@ -7,53 +7,163 @@ import os from 'os';
 import crypto from 'crypto';
 
 const app = express();
-const PORT = 7777;
+const PORT = Number(process.env.PORT || 7777);
+const STREAM_MIN_BUFFER = 8 * 1024 * 1024;
+const STREAM_WAIT_MS = 350;
 
-// Seguridad mínima sin romper <video src="http://127.0.0.1:7777/file?...">
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
 
-// Carpeta base: %TEMP%\aria2_streamer
 const tempDir = process.env.TEMP || process.env.TMP || os.tmpdir();
 const baseFolder = path.join(tempDir, 'aria2_streamer');
-if (!fs.existsSync(baseFolder)) {
-  fs.mkdirSync(baseFolder, { recursive: true });
-}
+fs.mkdirSync(baseFolder, { recursive: true });
 
-// Descargas activas
-// id -> { proc, file, done, lastSize, lastTs, speedBps, total, url, metaPath }
 const downloads = Object.create(null);
 
-// Utilidad: convierte valor+unidad (KiB/MiB/GiB/...) a bytes
 function unitToBytes(value, unitRaw) {
   if (!Number.isFinite(value)) return 0;
-  const u = (unitRaw || '').toUpperCase(); // 'K','M','G','KI','MI',...
-  const map = { '': 1, 'B': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3, 'T': 1024 ** 4, 'P': 1024 ** 5 };
-  const key = u.replace(/IB?$/, ''); // KiB/MiB/GiB -> K/M/G
-  const mul = map[key] ?? 1;
-  return Math.max(0, value * mul);
+  const unit = String(unitRaw || '').toUpperCase().replace(/IB?$/, '');
+  const map = { '': 1, B: 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4, P: 1024 ** 5 };
+  return Math.max(0, Math.floor(value * (map[unit] || 1)));
 }
 
-function writeMeta(id, url, outName) {
-  const meta = { id, url, outName, ts: Date.now() };
+function safeStatSize(file) {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return 0;
+  }
+}
+
+function normalizeUrlKey(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(String(value));
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return String(value).trim() || null;
+  }
+}
+
+function uniqAliases(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values || []) {
+    const key = normalizeUrlKey(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(key);
+  }
+  return result;
+}
+
+function getUrlFingerprintKeys(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values || []) {
+    if (!value) continue;
+    try {
+      const url = new URL(String(value));
+      url.hash = '';
+
+      const noHash = url.toString();
+      if (!seen.has(noHash)) {
+        seen.add(noHash);
+        result.push(noHash);
+      }
+
+      url.search = '';
+      const noQuery = url.toString();
+      if (!seen.has(noQuery)) {
+        seen.add(noQuery);
+        result.push(noQuery);
+      }
+
+      const pathOnly = `${url.origin}${url.pathname}`;
+      if (!seen.has(pathOnly)) {
+        seen.add(pathOnly);
+        result.push(pathOnly);
+      }
+    } catch {
+      const text = String(value).trim();
+      if (text && !seen.has(text)) {
+        seen.add(text);
+        result.push(text);
+      }
+    }
+  }
+  return result;
+}
+
+function buildMeta(id, url, outName, aliases = [], extra = {}) {
+  const aliasList = uniqAliases([url, ...aliases]);
+  return {
+    id,
+    url: normalizeUrlKey(url) || url,
+    aliases: aliasList,
+    fingerprints: getUrlFingerprintKeys(aliasList),
+    outName,
+    ts: Date.now(),
+    ...extra
+  };
+}
+
+function writeMeta(id, url, outName, aliases = [], extra = {}) {
+  const meta = buildMeta(id, url, outName, aliases, extra);
   const metaPath = path.join(baseFolder, `${id}.json`);
-  try { fs.writeFileSync(metaPath, JSON.stringify(meta)); } catch {}
+  try {
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  } catch {}
   return metaPath;
 }
 
-function readAllMetaForUrl(url) {
-  // Busca el meta más reciente que coincida con la URL
+function updateMetaFile(d, extra = {}) {
+  if (!d || !d.metaPath) return;
+  try {
+    const previous = fs.existsSync(d.metaPath) ? JSON.parse(fs.readFileSync(d.metaPath, 'utf8')) : {};
+    const aliases = uniqAliases([d.url, ...(Array.isArray(d.aliases) ? d.aliases : []), ...(Array.isArray(previous.aliases) ? previous.aliases : [])]);
+    const meta = {
+      ...previous,
+      id: previous.id || d.id,
+      url: previous.url || d.url,
+      aliases,
+      fingerprints: getUrlFingerprintKeys([...(Array.isArray(previous.fingerprints) ? previous.fingerprints : []), ...aliases]),
+      outName: previous.outName || path.basename(d.file),
+      ts: Date.now(),
+      ...extra
+    };
+    fs.writeFileSync(d.metaPath, JSON.stringify(meta, null, 2));
+  } catch {}
+}
+
+function metaMatches(meta, keys, fingerprints) {
+  if (!meta) return false;
+  const metaKeys = uniqAliases([meta.url, ...(Array.isArray(meta.aliases) ? meta.aliases : [])]);
+  if (keys && keys.length && metaKeys.some((item) => keys.includes(item))) return true;
+
+  const metaFingerprints = getUrlFingerprintKeys([
+    meta.url,
+    ...(Array.isArray(meta.aliases) ? meta.aliases : []),
+    ...(Array.isArray(meta.fingerprints) ? meta.fingerprints : [])
+  ]);
+  return !!(fingerprints && fingerprints.length && metaFingerprints.some((item) => fingerprints.includes(item)));
+}
+
+function readAllMetaForUrls(urls) {
+  const keys = uniqAliases(urls);
+  const fingerprints = getUrlFingerprintKeys(keys);
   let best = null;
   try {
-    const files = fs.readdirSync(baseFolder).filter(f => f.endsWith('.json'));
-    for (const f of files) {
-      const p = path.join(baseFolder, f);
+    const files = fs.readdirSync(baseFolder).filter((name) => name.endsWith('.json'));
+    for (const name of files) {
+      const file = path.join(baseFolder, name);
       try {
-        const j = JSON.parse(fs.readFileSync(p, 'utf8'));
-        if (j && j.url === url && Number.isFinite(j.ts)) {
-          if (!best || j.ts > best.ts) best = j;
+        const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (metaMatches(meta, keys, fingerprints) && Number.isFinite(meta.ts)) {
+          if (!best || meta.ts > best.ts) best = meta;
         }
       } catch {}
     }
@@ -61,69 +171,350 @@ function readAllMetaForUrl(url) {
   return best;
 }
 
-// Lanza aria2c y registra parsers
+function hashFileMd5(file) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('md5');
+    const stream = fs.createReadStream(file);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+function hydrateCompletedDownload(meta) {
+  if (!meta || !meta.id || !meta.outName) return null;
+  const file = path.join(baseFolder, meta.outName);
+  const exists = fs.existsSync(file);
+  if (!exists) return { exists: false, id: meta.id, done: false };
+
+  const size = safeStatSize(file);
+  downloads[meta.id] = {
+    id: meta.id,
+    proc: { kill() {} },
+    rpcPort: null,
+    rpcClosed: true,
+    file,
+    done: true,
+    downloaded: size,
+    total: size,
+    percent: 100,
+    speedBps: 0,
+    etaText: '0s',
+    etaSeconds: 0,
+    lastProgressTs: Date.now(),
+    url: normalizeUrlKey(meta.url) || meta.url,
+    aliases: uniqAliases([meta.url, ...(Array.isArray(meta.aliases) ? meta.aliases : [])]),
+    metaPath: path.join(baseFolder, `${meta.id}.json`),
+    md5: meta.md5 || null,
+    error: null,
+    logs: []
+  };
+  return { exists: true, id: meta.id, done: true, md5: meta.md5 || null, size };
+}
+
+function findExistingDownloadForUrls(urls) {
+  const keys = uniqAliases(urls);
+  const fingerprints = getUrlFingerprintKeys(keys);
+
+  for (const [id, d] of Object.entries(downloads)) {
+    const downloadKeys = uniqAliases([d.url, ...(Array.isArray(d.aliases) ? d.aliases : [])]);
+    const downloadFingerprints = getUrlFingerprintKeys(downloadKeys);
+    const keyMatch = downloadKeys.some((item) => keys.includes(item));
+    const fingerprintMatch = downloadFingerprints.some((item) => fingerprints.includes(item));
+    if (keyMatch || fingerprintMatch) {
+      const exists = fs.existsSync(d.file);
+      return { found: true, id, done: !!d.done, exists, md5: d.md5 || null, size: safeStatSize(d.file) };
+    }
+  }
+
+  const meta = readAllMetaForUrls(keys);
+  if (!meta) return { found: false };
+  const hydrated = hydrateCompletedDownload(meta);
+  if (!hydrated || !hydrated.exists) return { found: true, id: meta.id, done: false, exists: false };
+  return { found: true, id: hydrated.id, done: true, exists: true, md5: hydrated.md5 || null, size: hydrated.size };
+}
+
+function clampInt(value, min, max, fallback) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function pushLog(d, text) {
+  if (!d || !text) return;
+  const clean = String(text).replace(/[\r\n]+/g, ' ').trim();
+  if (!clean) return;
+  d.logs = d.logs || [];
+  d.logs.push(clean.slice(-1000));
+  if (d.logs.length > 10) d.logs.shift();
+}
+
+function getRecentLog(d) {
+  return Array.isArray(d.logs) && d.logs.length ? d.logs[d.logs.length - 1] : null;
+}
+
+function randomRpcPort() {
+  return 6800 + Math.floor(Math.random() * 1000);
+}
+
+async function rpcCall(port, method, params = []) {
+  const response = await fetch(`http://127.0.0.1:${port}/jsonrpc`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params })
+  });
+  if (!response.ok) throw new Error(`RPC HTTP ${response.status}`);
+  const payload = await response.json();
+  if (payload.error) throw new Error(payload.error.message || 'RPC error');
+  return payload.result;
+}
+
+function applyAria2Status(d, item) {
+  if (!d || !item) return;
+  const completed = Number.parseInt(item.completedLength || '0', 10);
+  const total = Number.parseInt(item.totalLength || '0', 10);
+  const speed = Number.parseInt(item.downloadSpeed || '0', 10);
+
+  if (Number.isFinite(completed)) d.downloaded = completed;
+  if (Number.isFinite(total) && total > 0) d.total = total;
+  if (Number.isFinite(speed)) d.speedBps = speed;
+
+  d.ariaStatus = item.status || d.ariaStatus || null;
+  d.gid = item.gid || d.gid || null;
+
+  if (d.total > 0) d.percent = Math.max(0, Math.min(100, Math.floor((d.downloaded / d.total) * 100)));
+  if (item.errorMessage) d.error = item.errorMessage;
+  if (item.status === 'complete') {
+    d.done = true;
+    d.percent = 100;
+    if (!d.total) d.total = safeStatSize(d.file);
+    if (!d.downloaded) d.downloaded = d.total || safeStatSize(d.file);
+  }
+  if (item.status === 'error' || item.status === 'removed') {
+    d.done = false;
+    d.error = item.errorMessage || `aria2 status: ${item.status}`;
+  }
+  d.lastProgressTs = Date.now();
+}
+
+async function refreshProgressFromRpc(d) {
+  if (!d || !d.rpcPort || d.rpcClosed) return;
+  try {
+    if (d.gid) {
+      try {
+        const item = await rpcCall(d.rpcPort, 'aria2.tellStatus', [d.gid, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'errorMessage']]);
+        applyAria2Status(d, item);
+        return;
+      } catch {}
+    }
+
+    const fields = ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'errorMessage'];
+    const active = await rpcCall(d.rpcPort, 'aria2.tellActive', [fields]);
+    if (Array.isArray(active) && active.length) {
+      applyAria2Status(d, active[0]);
+      return;
+    }
+
+    const waiting = await rpcCall(d.rpcPort, 'aria2.tellWaiting', [0, 1, fields]);
+    if (Array.isArray(waiting) && waiting.length) {
+      applyAria2Status(d, waiting[0]);
+      return;
+    }
+
+    const stopped = await rpcCall(d.rpcPort, 'aria2.tellStopped', [0, 1, fields]);
+    if (Array.isArray(stopped) && stopped.length) applyAria2Status(d, stopped[0]);
+  } catch (e) {
+    d.rpcError = String(e && e.message ? e.message : e);
+  }
+}
+
+function parseEtaToSeconds(raw) {
+  if (!raw) return null;
+  const text = String(raw).trim();
+  const m = text.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+  if (!m) return null;
+  const h = Number(m[1] || 0);
+  const min = Number(m[2] || 0);
+  const s = Number(m[3] || 0);
+  return h * 3600 + min * 60 + s;
+}
+
+function updateProgressFromText(d, text) {
+  if (!d) return;
+  try {
+    pushLog(d, text);
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const gidMatch = line.match(/\[#([0-9a-f]+)\b/i);
+    if (gidMatch) d.gid = gidMatch[1];
+    const bracket = line.match(/\[#\w+\s+([\d.]+)\s*([KMGTP]?i?)?B\/(~?)([\d.]+)\s*([KMGTP]?i?)?B\((\d+)%\).*?(?:DL:([\d.]+)\s*([KMGTP]?i?)?B)?(?:.*?ETA:([^\]\s]+))?/i);
+    if (bracket) {
+      d.downloaded = unitToBytes(Number.parseFloat(bracket[1]), bracket[2]);
+      d.total = unitToBytes(Number.parseFloat(bracket[4]), bracket[5]);
+      d.percent = clampInt(bracket[6], 0, 100, d.percent || 0);
+      if (bracket[7]) d.speedBps = unitToBytes(Number.parseFloat(bracket[7]), bracket[8]);
+      if (bracket[9]) {
+        d.etaText = bracket[9];
+        d.etaSeconds = parseEtaToSeconds(bracket[9]);
+      }
+      d.lastProgressTs = Date.now();
+      continue;
+    }
+
+    const ofMatch = line.match(/([\d.]+)%\s+of\s+~?([\d.]+)\s*([KMGTP]?i?)?B\s+at\s+([\d.]+)\s*([KMGTP]?i?)?B\/s/i);
+    if (ofMatch) {
+      d.percent = clampInt(ofMatch[1], 0, 100, d.percent || 0);
+      d.total = unitToBytes(Number.parseFloat(ofMatch[2]), ofMatch[3]);
+      d.speedBps = unitToBytes(Number.parseFloat(ofMatch[4]), ofMatch[5]);
+      d.downloaded = Math.floor((d.total * d.percent) / 100);
+      d.lastProgressTs = Date.now();
+    }
+  }
+  } catch (e) {
+    try {
+      if (d) {
+        d.parserError = String(e && e.message ? e.message : e);
+        pushLog(d, `progress parser error: ${d.parserError}`);
+      }
+    } catch {}
+  }
+}
+
+function getVisibleStatus(d) {
+  const diskSize = safeStatSize(d.file);
+  const parsedDownloaded = Number.isFinite(d.downloaded) ? d.downloaded : 0;
+  const total = Number.isFinite(d.total) ? d.total : 0;
+  let downloaded = parsedDownloaded;
+
+  if (!downloaded && diskSize && (!total || diskSize <= total)) {
+    downloaded = diskSize;
+  }
+
+  if (d.done) {
+    downloaded = Math.max(downloaded, diskSize);
+    if (!total && diskSize) d.total = diskSize;
+  }
+
+  const finalTotal = d.total || total || 0;
+  const percent = finalTotal > 0 ? Math.min(100, Math.floor((downloaded / finalTotal) * 100)) : d.percent || 0;
+  const speedBps = Math.max(0, Math.floor(d.speedBps || 0));
+  const etaSeconds = !d.done && finalTotal > 0 && speedBps > 0 ? Math.ceil((finalTotal - downloaded) / speedBps) : null;
+
+  return {
+    downloaded,
+    total: finalTotal,
+    speedBps,
+    etaSeconds,
+    etaText: d.done ? '0s' : d.etaText || null,
+    percent,
+    done: !!d.done,
+    streamReady: finalTotal > 0 && (diskSize >= Math.min(Math.max(STREAM_MIN_BUFFER, Math.floor(finalTotal * 0.02)), 64 * 1024 * 1024) || (!!d.done && diskSize > 0))
+  };
+}
+
 app.get('/start', (req, res) => {
   try {
     const src = req.query.url;
     if (!src) return res.status(400).json({ ok: false, error: 'Missing url' });
 
+    const aliases = uniqAliases([
+      src,
+      req.query.pageUrl,
+      req.query.canonicalUrl,
+      ...String(req.query.aliases || '').split(/\r?\n/)
+    ]);
+
     const id = crypto.randomBytes(8).toString('hex');
     const outName = `${id}.mp4`;
     const outFile = path.join(baseFolder, outName);
+    const connections = clampInt(req.query.connections, 1, 16, 16);
+    const split = clampInt(req.query.split, 1, 16, connections);
+    const rpcPort = randomRpcPort();
 
     const args = [
       '--allow-overwrite=true',
+      '--auto-file-renaming=false',
+      '--continue=true',
+      '--file-allocation=none',
+      '--stream-piece-selector=inorder',
+      '--enable-rpc=true',
+      '--rpc-listen-all=false',
+      `--rpc-listen-port=${rpcPort}`,
       '--dir', baseFolder,
       '--out', outName,
-      '--max-connection-per-server=16',
-      '--split=16',
+      `--max-connection-per-server=${connections}`,
+      `--split=${split}`,
       '--min-split-size=1M',
-      '--console-log-level=notice', // para que emita progreso
+      '--console-log-level=notice',
       '--summary-interval=1',
+      '--max-tries=3',
+      '--retry-wait=2',
       src
     ];
 
-    // Hereda sesión (si la extensión envía cabeceras)
     const headers = [];
-    if (req.headers['x-src-cookie'])   headers.push(`Cookie: ${req.headers['x-src-cookie']}`);
+    if (req.headers['x-src-cookie']) headers.push(`Cookie: ${req.headers['x-src-cookie']}`);
     if (req.headers['x-src-referrer']) headers.push(`Referer: ${req.headers['x-src-referrer']}`);
-    if (req.headers['x-src-ua'])       headers.push(`User-Agent: ${req.headers['x-src-ua']}`);
-    headers.forEach(h => args.push('--header', h));
+    if (req.headers['x-src-origin']) headers.push(`Origin: ${req.headers['x-src-origin']}`);
+    if (req.headers['x-src-ua']) headers.push(`User-Agent: ${req.headers['x-src-ua']}`);
+    if (req.headers['x-src-accept']) headers.push(`Accept: ${req.headers['x-src-accept']}`);
+    if (req.headers['x-src-accept-language']) headers.push(`Accept-Language: ${req.headers['x-src-accept-language']}`);
+    headers.push('Connection: keep-alive');
+    for (const header of headers) args.push('--header', header);
 
     const proc = spawn('aria2c', args, { windowsHide: true });
-
-    const metaPath = writeMeta(id, src, outName);
+    const metaPath = writeMeta(id, src, outName, aliases);
 
     downloads[id] = {
+      id,
       proc,
+      rpcPort,
+      rpcClosed: false,
       file: outFile,
       done: false,
-      lastSize: 0,
-      lastTs: Date.now(),
-      speedBps: 0,
+      downloaded: 0,
       total: 0,
-      url: src,
-      metaPath
+      percent: 0,
+      speedBps: 0,
+      etaText: null,
+      etaSeconds: null,
+      lastProgressTs: Date.now(),
+      url: normalizeUrlKey(src) || src,
+      aliases,
+      metaPath,
+      error: null,
+      parserError: null,
+      logs: []
     };
 
-    // Parseo opcional de total y velocidad desde stderr
-    // Ejemplo: "... 12.3% of ~123.45MiB at 3.21MiB/s ..."
-    const re = /(\d+(?:\.\d+)?)%\s+of\s+~?(\d+(?:\.\d+)?)\s*([KMGTP]i?)?B\s+at\s+(\d+(?:\.\d+)?)\s*([KMGTP]i?)?B\/s/i;
-    proc.stderr.on('data', (buf) => {
-      const line = buf.toString();
-      const m = line.match(re);
-      if (m) {
-        const totalVal = parseFloat(m[2]);
-        const totalUnit = (m[3] || '').toString();
-        const speedVal = parseFloat(m[4]);
-        const speedUnit = (m[5] || '').toString();
-        if (Number.isFinite(totalVal)) downloads[id].total = unitToBytes(totalVal, totalUnit);
-        if (Number.isFinite(speedVal)) downloads[id].speedBps = unitToBytes(speedVal, speedUnit);
-      }
+    const currentDownload = downloads[id];
+    proc.stdout.on('data', (buf) => updateProgressFromText(currentDownload, buf.toString()));
+    proc.stderr.on('data', (buf) => updateProgressFromText(currentDownload, buf.toString()));
+    proc.on('error', (err) => {
+      if (downloads[id]) downloads[id].error = String(err && err.message ? err.message : err);
     });
-
-    proc.on('close', (_code) => {
-      if (downloads[id]) downloads[id].done = true;
+    proc.on('close', (code) => {
+      if (!downloads[id]) return;
+      downloads[id].rpcClosed = true;
+      downloads[id].exitCode = code;
+      if (code === 0) {
+        downloads[id].done = true;
+        downloads[id].percent = 100;
+        const size = safeStatSize(downloads[id].file);
+        if (!downloads[id].total && size) downloads[id].total = size;
+        if (!downloads[id].downloaded && size) downloads[id].downloaded = size;
+        updateMetaFile(downloads[id], { size, done: true });
+        hashFileMd5(downloads[id].file)
+          .then((md5) => {
+            if (!downloads[id]) return;
+            downloads[id].md5 = md5;
+            updateMetaFile(downloads[id], { size: safeStatSize(downloads[id].file), md5, done: true });
+          })
+          .catch(() => {});
+      } else {
+        downloads[id].done = false;
+        downloads[id].error = downloads[id].error || getRecentLog(downloads[id]) || `aria2 exited with code ${code}`;
+      }
     });
 
     res.json({ ok: true, id });
@@ -132,55 +523,108 @@ app.get('/start', (req, res) => {
   }
 });
 
-// Estado: calcula velocidad con delta de tamaño en disco
-app.get('/status', (req, res) => {
+app.get('/status', async (req, res) => {
   try {
     const id = req.query.id;
     const d = id && downloads[id];
     if (!d) return res.json({ ok: false, error: 'Unknown id' });
-
-    let size = 0;
-    try {
-      const st = fs.statSync(d.file);
-      size = st.size;
-    } catch {
-      size = 0;
-    }
-
-    const now = Date.now();
-    const dt = (now - d.lastTs) / 1000; // seg
-    if (dt > 0) {
-      const delta = size - d.lastSize;
-      const calc = delta > 0 ? (delta / dt) : 0;
-      d.speedBps = Math.max(d.speedBps || 0, calc);
-      d.lastSize = size;
-      d.lastTs = now;
-    }
-
-    res.json({
-      downloaded: size,
-      total: d.total || 0,
-      speedBps: Math.max(0, Math.floor(d.speedBps)),
-      done: !!d.done
-    });
+    await refreshProgressFromRpc(d);
+    const status = getVisibleStatus(d);
+    if (d.error) status.error = d.error;
+    if (d.rpcError && !d.done && !status.error) status.rpcError = d.rpcError;
+    status.ariaStatus = d.ariaStatus || null;
+    status.exitCode = d.exitCode;
+    status.lastLog = getRecentLog(d);
+    res.json(status);
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Sirve el archivo
-app.get('/file', (req, res) => {
+function parseRangeHeader(rangeHeader) {
+  if (!rangeHeader) return null;
+  const m = String(rangeHeader).match(/^bytes=(\d*)-(\d*)$/);
+  if (!m) return null;
+  return {
+    start: m[1] === '' ? null : Number.parseInt(m[1], 10),
+    end: m[2] === '' ? null : Number.parseInt(m[2], 10)
+  };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function streamGrowingFile(req, res, d, start, end, totalForHeaders) {
+  let pos = start;
+  let closed = false;
+  req.on('close', () => { closed = true; });
+
+  while (!closed && pos <= end) {
+    const available = safeStatSize(d.file);
+    const availableEnd = Math.min(end, available - 1);
+
+    if (availableEnd >= pos) {
+      await new Promise((resolve, reject) => {
+        const stream = fs.createReadStream(d.file, { start: pos, end: availableEnd });
+        stream.on('data', (chunk) => { pos += chunk.length; });
+        stream.on('end', resolve);
+        stream.on('error', reject);
+        stream.pipe(res, { end: false });
+      }).catch(() => { closed = true; });
+      continue;
+    }
+
+    if (d.done) break;
+    await wait(STREAM_WAIT_MS);
+  }
+
+  if (!res.destroyed && !closed) res.end();
+}
+
+app.get('/file', async (req, res) => {
   try {
     const id = req.query.id;
     const d = id && downloads[id];
     if (!d) return res.status(404).end();
-    res.sendFile(d.file);
+
+    const range = parseRangeHeader(req.headers.range);
+    const status = getVisibleStatus(d);
+    const total = status.total || safeStatSize(d.file);
+
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!range) {
+      if (total > 0) res.setHeader('Content-Length', total);
+      return streamGrowingFile(req, res, d, 0, Math.max(total - 1, 0), total);
+    }
+
+    let start = range.start;
+    let end = range.end;
+
+    if (start === null && end !== null && total > 0) start = Math.max(0, total - end);
+    if (start === null) start = 0;
+    if (end === null) end = total > 0 ? total - 1 : Math.max(safeStatSize(d.file) - 1, start);
+    if (total > 0) end = Math.min(end, total - 1);
+
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) {
+      res.status(416).setHeader('Content-Range', `bytes */${total || '*'}`);
+      return res.end();
+    }
+
+    const contentLength = total > 0 ? (end - start + 1) : undefined;
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total || '*'}`);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    return streamGrowingFile(req, res, d, start, end, total);
   } catch {
-    res.status(500).end();
+    if (!res.headersSent) res.status(500);
+    res.end();
   }
 });
 
-// Elimina descarga/archivo (y mata aria2c)
 app.get('/delete', (req, res) => {
   try {
     const id = req.query.id;
@@ -198,50 +642,44 @@ app.get('/delete', (req, res) => {
   }
 });
 
-// NUEVO: encontrar si una URL ya existe (descarga en curso o terminada)
 app.get('/find', (req, res) => {
   try {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ ok: false, error: 'Missing url' });
+    const rawUrls = Array.isArray(req.query.url) ? req.query.url : [req.query.url];
+    const urls = rawUrls.filter(Boolean);
+    if (!urls.length) return res.status(400).json({ ok: false, error: 'Missing url' });
 
-    // 1) Busca en memoria (descarga activa)
-    for (const [id, d] of Object.entries(downloads)) {
-      if (d.url === url) {
-        const exists = fs.existsSync(d.file);
-        return res.json({ ok: true, found: true, id, done: !!d.done, exists });
-      }
+    const existing = findExistingDownloadForUrls(urls);
+    if (existing.found) {
+      return res.json({
+        ok: true,
+        found: true,
+        id: existing.id,
+        done: !!existing.done,
+        exists: !!existing.exists,
+        md5: existing.md5 || null,
+        size: existing.size || 0
+      });
     }
 
-    // 2) Busca en meta files (terminadas o previas)
-    const meta = readAllMetaForUrl(url);
-    if (meta) {
-      const file = path.join(baseFolder, meta.outName);
-      const exists = fs.existsSync(file);
-      return res.json({ ok: true, found: true, id: meta.id, done: exists, exists });
-    }
-
-    // 3) No encontrada
     return res.json({ ok: true, found: false });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Abrir carpeta local %TEMP%\aria2_streamer en el explorador
 app.get('/open-folder', (_req, res) => {
   try {
-    const folder = baseFolder;
-    if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
+    fs.mkdirSync(baseFolder, { recursive: true });
 
     if (process.platform === 'win32') {
-      spawn('explorer', [folder], { detached: true, stdio: 'ignore' }).unref();
+      spawn('explorer', [baseFolder], { detached: true, stdio: 'ignore' }).unref();
     } else if (process.platform === 'darwin') {
-      spawn('open', [folder], { detached: true, stdio: 'ignore' }).unref();
+      spawn('open', [baseFolder], { detached: true, stdio: 'ignore' }).unref();
     } else {
-      spawn('xdg-open', [folder], { detached: true, stdio: 'ignore' }).unref();
+      spawn('xdg-open', [baseFolder], { detached: true, stdio: 'ignore' }).unref();
     }
 
-    res.json({ ok: true, folder });
+    res.json({ ok: true, folder: baseFolder });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
