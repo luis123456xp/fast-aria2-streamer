@@ -180,6 +180,13 @@
   font-size: 13px;
 }
 
+#aria2-launcher .aria2-mode{
+  margin-bottom: 10px;
+  color: rgba(255,255,255,.82);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 #aria2-launcher .aria2-start-btn{
   width: 100%;
   padding: 8px 10px;

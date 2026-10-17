@@ -1,7 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Aria2 Video Stream Bridge",
-  "version": "1.9.0",
+  "version": "2.1.0",
+  "action": {
+    "default_title": "Aria2: descarga y opciones al salir",
+    "default_popup": "popup.html"
+  },
   "permissions": [
     "scripting",
     "activeTab",
@@ -22,6 +26,7 @@
         "<all_urls>"
       ],
       "js": [
+        "source-selection.js",
         "content.js"
       ],
       "css": [

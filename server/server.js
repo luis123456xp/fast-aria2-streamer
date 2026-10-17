@@ -5,10 +5,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { pathToFileURL } from 'url';
 
 const app = express();
 const PORT = Number(process.env.PORT || 7777);
 const STREAM_MIN_BUFFER = 8 * 1024 * 1024;
+const MP4_PROBE_BYTES = 4 * 1024 * 1024;
 const STREAM_WAIT_MS = 350;
 
 app.use(helmet({
@@ -35,6 +37,72 @@ function safeStatSize(file) {
   } catch {
     return 0;
   }
+}
+
+function inspectMp4Layout(file, availableBytes, done = false) {
+  const readableBytes = Math.min(Math.max(0, availableBytes || 0), MP4_PROBE_BYTES);
+  if (readableBytes < 8 || !fs.existsSync(file)) {
+    return { metadataReady: false, moovAtEnd: false, reason: 'waiting-for-mp4-header' };
+  }
+
+  let buffer;
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      buffer = Buffer.alloc(readableBytes);
+      const read = fs.readSync(fd, buffer, 0, readableBytes, 0);
+      buffer = buffer.subarray(0, read);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return { metadataReady: false, moovAtEnd: false, reason: 'waiting-for-mp4-header' };
+  }
+
+  let offset = 0;
+  while (offset + 8 <= buffer.length) {
+    let boxSize = buffer.readUInt32BE(offset);
+    const boxType = buffer.toString('ascii', offset + 4, offset + 8);
+    let headerSize = 8;
+
+    if (boxSize === 1) {
+      if (offset + 16 > buffer.length) break;
+      const extendedSize = buffer.readBigUInt64BE(offset + 8);
+      if (extendedSize > BigInt(Number.MAX_SAFE_INTEGER)) break;
+      boxSize = Number(extendedSize);
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      boxSize = Math.max(headerSize, availableBytes - offset);
+    }
+
+    if (boxSize < headerSize) break;
+
+    if (boxType === 'moov') {
+      const complete = done || offset + boxSize <= availableBytes;
+      return {
+        metadataReady: complete,
+        moovAtEnd: false,
+        reason: complete ? 'mp4-metadata-ready' : 'waiting-for-complete-moov'
+      };
+    }
+
+    if (boxType === 'mdat') {
+      return {
+        metadataReady: !!done,
+        moovAtEnd: true,
+        reason: done ? 'download-complete' : 'moov-at-end'
+      };
+    }
+
+    if (offset + boxSize > buffer.length) break;
+    offset += boxSize;
+  }
+
+  return {
+    metadataReady: !!done,
+    moovAtEnd: false,
+    reason: done ? 'download-complete' : 'waiting-for-mp4-metadata'
+  };
 }
 
 function normalizeUrlKey(value) {
@@ -274,10 +342,17 @@ function applyAria2Status(d, item) {
   const completed = Number.parseInt(item.completedLength || '0', 10);
   const total = Number.parseInt(item.totalLength || '0', 10);
   const speed = Number.parseInt(item.downloadSpeed || '0', 10);
+  const pieceLength = Number.parseInt(item.pieceLength || '0', 10);
+  const numPieces = Number.parseInt(item.numPieces || '0', 10);
+  const activeConnections = Number.parseInt(item.connections || '0', 10);
 
   if (Number.isFinite(completed)) d.downloaded = completed;
   if (Number.isFinite(total) && total > 0) d.total = total;
   if (Number.isFinite(speed)) d.speedBps = speed;
+  if (Number.isFinite(pieceLength) && pieceLength > 0) d.pieceLength = pieceLength;
+  if (Number.isFinite(numPieces) && numPieces > 0) d.numPieces = numPieces;
+  if (Number.isFinite(activeConnections)) d.activeConnections = activeConnections;
+  if (typeof item.bitfield === 'string') d.bitfield = item.bitfield;
 
   d.ariaStatus = item.status || d.ariaStatus || null;
   d.gid = item.gid || d.gid || null;
@@ -302,13 +377,13 @@ async function refreshProgressFromRpc(d) {
   try {
     if (d.gid) {
       try {
-        const item = await rpcCall(d.rpcPort, 'aria2.tellStatus', [d.gid, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'errorMessage']]);
+        const item = await rpcCall(d.rpcPort, 'aria2.tellStatus', [d.gid, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'errorMessage', 'bitfield', 'pieceLength', 'numPieces', 'connections']]);
         applyAria2Status(d, item);
         return;
       } catch {}
     }
 
-    const fields = ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'errorMessage'];
+    const fields = ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'errorMessage', 'bitfield', 'pieceLength', 'numPieces', 'connections'];
     const active = await rpcCall(d.rpcPort, 'aria2.tellActive', [fields]);
     if (Array.isArray(active) && active.length) {
       applyAria2Status(d, active[0]);
@@ -326,6 +401,40 @@ async function refreshProgressFromRpc(d) {
   } catch (e) {
     d.rpcError = String(e && e.message ? e.message : e);
   }
+}
+
+function getContiguousAvailableBytes(d) {
+  const diskSize = safeStatSize(d.file);
+  if (d.done) return diskSize;
+
+  const pieceLength = Number.isFinite(d.pieceLength) ? d.pieceLength : 0;
+  const numPieces = Number.isFinite(d.numPieces) ? d.numPieces : 0;
+  const bitfield = typeof d.bitfield === 'string' ? d.bitfield.trim() : '';
+
+  if (pieceLength > 0 && numPieces > 0 && /^[0-9a-f]+$/i.test(bitfield)) {
+    let completedPrefixPieces = 0;
+    for (let index = 0; index < numPieces; index += 1) {
+      const nibbleIndex = Math.floor(index / 4);
+      if (nibbleIndex >= bitfield.length) break;
+      const nibble = Number.parseInt(bitfield[nibbleIndex], 16);
+      const mask = 1 << (3 - (index % 4));
+      if ((nibble & mask) === 0) break;
+      completedPrefixPieces += 1;
+    }
+
+    const prefixBytes = completedPrefixPieces * pieceLength;
+    const total = Number.isFinite(d.total) && d.total > 0 ? d.total : prefixBytes;
+    return Math.min(diskSize, total, prefixBytes);
+  }
+
+  // With one connection aria2 writes from the beginning, so this fallback is
+  // safe while RPC is starting. It is intentionally disabled for segmented jobs.
+  if ((d.configuredConnections || 1) <= 1) {
+    const downloaded = Number.isFinite(d.downloaded) && d.downloaded > 0 ? d.downloaded : diskSize;
+    return Math.min(diskSize, downloaded);
+  }
+
+  return 0;
 }
 
 function parseEtaToSeconds(raw) {
@@ -386,7 +495,7 @@ function getVisibleStatus(d) {
   const total = Number.isFinite(d.total) ? d.total : 0;
   let downloaded = parsedDownloaded;
 
-  if (!downloaded && diskSize && (!total || diskSize <= total)) {
+  if (!downloaded && diskSize && (!total || diskSize <= total) && (d.done || (d.configuredConnections || 1) <= 1)) {
     downloaded = diskSize;
   }
 
@@ -399,6 +508,19 @@ function getVisibleStatus(d) {
   const percent = finalTotal > 0 ? Math.min(100, Math.floor((downloaded / finalTotal) * 100)) : d.percent || 0;
   const speedBps = Math.max(0, Math.floor(d.speedBps || 0));
   const etaSeconds = !d.done && finalTotal > 0 && speedBps > 0 ? Math.ceil((finalTotal - downloaded) / speedBps) : null;
+  const contiguousAvailableBytes = getContiguousAvailableBytes(d);
+  const bufferTargetBytes = finalTotal > 0
+    ? Math.min(finalTotal, Math.min(Math.max(STREAM_MIN_BUFFER, Math.floor(finalTotal * 0.02)), 64 * 1024 * 1024))
+    : STREAM_MIN_BUFFER;
+  let mp4 = d.mp4Layout;
+  const mustRefreshMp4 = !mp4
+    || (!mp4.metadataReady && !mp4.moovAtEnd)
+    || (!!d.done && !mp4.metadataReady);
+  if (mustRefreshMp4) {
+    mp4 = inspectMp4Layout(d.file, contiguousAvailableBytes, d.done);
+    if (mp4.metadataReady || mp4.moovAtEnd) d.mp4Layout = mp4;
+  }
+  const enoughBuffer = contiguousAvailableBytes >= bufferTargetBytes;
 
   return {
     downloaded,
@@ -408,7 +530,14 @@ function getVisibleStatus(d) {
     etaText: d.done ? '0s' : d.etaText || null,
     percent,
     done: !!d.done,
-    streamReady: finalTotal > 0 && (diskSize >= Math.min(Math.max(STREAM_MIN_BUFFER, Math.floor(finalTotal * 0.02)), 64 * 1024 * 1024) || (!!d.done && diskSize > 0))
+    configuredConnections: d.configuredConnections || 1,
+    activeConnections: d.activeConnections || 0,
+    contiguousAvailableBytes,
+    bufferTargetBytes,
+    mp4MetadataReady: mp4.metadataReady,
+    moovAtEnd: mp4.moovAtEnd,
+    streamReadyReason: mp4.reason,
+    streamReady: (!!d.done && diskSize > 0) || (finalTotal > 0 && enoughBuffer && mp4.metadataReady)
   };
 }
 
@@ -437,6 +566,7 @@ app.get('/start', (req, res) => {
       '--continue=true',
       '--file-allocation=none',
       '--stream-piece-selector=inorder',
+      '--piece-length=1M',
       '--enable-rpc=true',
       '--rpc-listen-all=false',
       `--rpc-listen-port=${rpcPort}`,
@@ -470,6 +600,7 @@ app.get('/start', (req, res) => {
       proc,
       rpcPort,
       rpcClosed: false,
+      configuredConnections: connections,
       file: outFile,
       done: false,
       downloaded: 0,
@@ -517,7 +648,7 @@ app.get('/start', (req, res) => {
       }
     });
 
-    res.json({ ok: true, id });
+    res.json({ ok: true, id, streamingMode: true, connections, split });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -561,7 +692,7 @@ async function streamGrowingFile(req, res, d, start, end, totalForHeaders) {
   req.on('close', () => { closed = true; });
 
   while (!closed && pos <= end) {
-    const available = safeStatSize(d.file);
+    const available = getContiguousAvailableBytes(d);
     const availableEnd = Math.min(end, available - 1);
 
     if (availableEnd >= pos) {
@@ -575,7 +706,7 @@ async function streamGrowingFile(req, res, d, start, end, totalForHeaders) {
       continue;
     }
 
-    if (d.done) break;
+    if (d.done || d.error) break;
     await wait(STREAM_WAIT_MS);
   }
 
@@ -631,6 +762,7 @@ app.get('/delete', (req, res) => {
     const d = id && downloads[id];
     if (!d) return res.json({ ok: false });
 
+    d.error = 'Download deleted';
     try { d.proc.kill('SIGKILL'); } catch {}
     try { if (fs.existsSync(d.file)) fs.unlinkSync(d.file); } catch {}
     try { if (d.metaPath && fs.existsSync(d.metaPath)) fs.unlinkSync(d.metaPath); } catch {}
@@ -685,6 +817,10 @@ app.get('/open-folder', (_req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on http://127.0.0.1:${PORT} (dir: ${baseFolder})`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  app.listen(PORT, () => {
+    console.log(`Server listening on http://127.0.0.1:${PORT} (dir: ${baseFolder})`);
+  });
+}
+
+export { app, downloads, getContiguousAvailableBytes, getVisibleStatus, inspectMp4Layout, streamGrowingFile };

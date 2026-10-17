@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Opciones de aria2</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1>Aria2 Streamer</h1>
+  <label class="automatic"><input type="checkbox" id="auto-start"> Descargar automáticamente con aria2</label>
+  <fieldset>
+    <legend>Al cerrar la pestaña o salir de la página</legend>
+    <label><input type="radio" name="close-mode" value="keep"> Dejar al cerrar</label>
+    <p>Conserva el archivo y deja que la descarga termine.</p>
+    <label><input type="radio" name="close-mode" value="delete"> Borrar al salir</label>
+    <p>Cancela la descarga y borra el archivo cuando dejas de usarlo.</p>
+  </fieldset>
+  <p>La selección se guarda para todas las páginas y próximas sesiones. Si otra pestaña usa el mismo archivo, se borra al salir de la última.</p>
+  <p>El servidor local debe estar iniciado.</p>
+  <div id="status" role="status" aria-live="polite">Cargando preferencias…</div>
+  <script src="popup.js"></script>
+</body>
+</html>
